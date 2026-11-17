@@ -8,6 +8,7 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.editor.GetActiveFile
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.editor.OpenFileTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.intelligence.GetDiagnosticsTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.intelligence.ProjectDiagnosticsTool
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.inspection.InspectTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.navigation.FindClassTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.navigation.FindDefinitionTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.navigation.FindFileTool
@@ -255,6 +256,7 @@ class ToolRegistry {
         // Intelligence tools
         register(GetDiagnosticsTool())
         register(ProjectDiagnosticsTool())
+        register(InspectTool())
 
         // Project tools
         register(GetIndexStatusTool())
