@@ -43,6 +43,7 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.project.SyncFilesToo
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.ChangeSignatureTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.CreateFileTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.EditMemberTool
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.ExtractMethodTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.InsertMemberTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.MoveFileTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.OptimizeImportsTool
@@ -291,6 +292,7 @@ class ToolRegistry {
         // Code editing tools (universal - uses Document APIs with PSI for location)
         register(EditMemberTool())
         register(InsertMemberTool())
+        register(ExtractMethodTool())
         register(ReplaceMemberTool())
 
         // Fast search tools (universal)
