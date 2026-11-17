@@ -40,6 +40,9 @@ class InspectTool : AbstractMcpTool() {
         private const val MAX_MAX_PROBLEMS = 2000
         private const val MAX_ENGINE_ATTEMPTS = 15
         private const val RETRY_SETTLE_MS = 3000L
+
+        // foundDescriptorCallback: "when returned true -> add to the holder"
+        private val TRUE_PAIR_PROCESSOR = com.intellij.util.PairProcessor<Any, Any> { _, _ -> true }
     }
 
     @Serializable
@@ -65,10 +68,13 @@ class InspectTool : AbstractMcpTool() {
         Run code analysis over a scope, inside the running IDE — no detached JVM, shared hot indexes.
 
         Engines: 'standard' = platform pre-commit batch engine (fast, native local-inspection subset).
-        'full' = the SAME engine behind GUI Analyze | Inspect Code, driven reflectively in-process:
-        runs the complete project profile including third-party inspection plugins (e.g. Alibaba P3C)
-        and exports per-inspection XML reports to a directory; the result JSON points at that
-        directory plus aggregate stats (parse the XMLs for details).
+        'full' = two complementary in-process passes, no detached JVM:
+        1) daemon-core: per-file InspectionEngine (the SAME engine the in-editor daemon runs) over the
+        complete project profile's LOCAL tools incl. third-party plugins (e.g. Alibaba P3C) — used for
+        scoped runs (files/uncommitted);
+        2) batch pipeline: the engine behind GUI Analyze | Inspect Code for GLOBAL tools (unused
+        declaration etc), exporting per-inspection XML reports to a directory.
+        'whole' scope runs the batch pipeline only.
 
         Scopes: 'uncommitted' (files with uncommitted VCS changes — the agent's working set; requires a VCS plugin), 'files' (explicit list via 'files', max $MAX_FILES), 'whole' (entire project — slow on large projects).
 
@@ -131,7 +137,18 @@ class InspectTool : AbstractMcpTool() {
         val engine = optionalStringArg(arguments, "engine") ?: "standard"
 
         if (engine == "full") {
-            return runFullEngineInspect(project, scopeArg, scopeFiles)
+            // Scoped runs (files/uncommitted) get BOTH: daemon-equivalent per-file local analysis
+            // (the engine proven to produce P3C findings on 262, unlike the batch local phase) and
+            // the batch pipeline for global tools (unused declaration etc). 'whole' = batch only.
+            return createSuccessResult(
+                buildString {
+                    if (scopeArg != "whole") {
+                        appendLine(runDirectLocalInspect(project, scopeFiles))
+                        appendLine()
+                    }
+                    append(runFullEngineInspect(project, scopeArg, scopeFiles))
+                }
+            )
         }
 
         val detector = CodeSmellDetector.getInstance(project)
@@ -224,7 +241,7 @@ class InspectTool : AbstractMcpTool() {
      * runtime-only, not on the plugin compile classpath) and exports per-inspection XML
      * reports — bit-identical data to the GUI run and the headless `inspect.bat`.
      */
-    private fun runFullEngineInspect(project: Project, scopeArg: String, scopeFiles: List<VirtualFile>): CallToolResult {
+    private fun runFullEngineInspect(project: Project, scopeArg: String, scopeFiles: List<VirtualFile>): String {
         val done = java.util.concurrent.CompletableFuture<String>()
         com.intellij.openapi.progress.ProgressManager.getInstance()
             .run(object : com.intellij.openapi.progress.Task.Backgroundable(project, "ide_inspect (full)", true) {
@@ -259,19 +276,123 @@ class InspectTool : AbstractMcpTool() {
                 }
             })
         return try {
-            val text = done.get(10, java.util.concurrent.TimeUnit.MINUTES)
-            createSuccessResult(text)
+            done.get(10, java.util.concurrent.TimeUnit.MINUTES)
         } catch (e: java.util.concurrent.ExecutionException) {
             var root: Throwable = e
             while (root.cause != null && root.cause !== root) root = root.cause!!
-            createErrorResult(
-                "Full inspection engine failed after retries: ${root.javaClass.simpleName}: ${root.message}\n" +
-                    root.stackTrace.take(4).joinToString("\n") { "  at " + it }
-            )
+            "Full inspection engine failed after retries: ${root.javaClass.simpleName}: ${root.message}\n" +
+                root.stackTrace.take(4).joinToString("\n") { "  at " + it }
         } catch (e: Throwable) {
-            createErrorResult("Full inspection engine unavailable on this build: ${e.message}")
+            "Full inspection engine unavailable on this build: ${e.message}"
         }
     }
+
+    /**
+     * Daemon-equivalent direct engine: per-file InspectionEngine.inspectEx over the profile's
+     * enabled LOCAL tools — the same engine the in-editor daemon runs, which is proven to
+     * produce P3C findings on 262 (the batch pipeline's local phase silently does not).
+     * Scoped runs only (files/uncommitted); impl classes are runtime-only → reflection.
+     */
+    private suspend fun runDirectLocalInspect(project: Project, scopeFiles: List<VirtualFile>): String {
+        if (scopeFiles.isEmpty()) {
+            return """{"engine":"daemon-core","scope":"files","filesInspected":0,"total":0,"problems":[]}"""
+        }
+        return try {
+            val appCl = com.intellij.openapi.application.ApplicationManager.getApplication().javaClass.classLoader
+            val engineClass = Class.forName("com.intellij.codeInspection.InspectionEngine", true, appCl)
+            // 262 runtime signature: (List, PsiFile, TextRange, TextRange, 3xboolean, ProgressIndicator, PairProcessor)
+            // (master dropped the indicator param — do NOT copy from master sources)
+            val indicatorType = com.intellij.openapi.progress.ProgressIndicator::class.java
+            val inspectEx = engineClass.methods.first { m ->
+                m.name == "inspectEx" && m.parameterCount == 9 && m.parameterTypes[7] == indicatorType
+            }
+            val liwName = "com.intellij.codeInspection.ex.LocalInspectionToolWrapper"
+
+            val profile = com.intellij.profile.codeInspection.InspectionProjectProfileManager
+                .getInstance(project).currentProfile
+            val allTools = profile.javaClass.methods
+                .firstOrNull { it.name == "getAllEnabledInspectionTools" && it.parameterCount == 1 }
+                ?.invoke(profile, project) as? List<*> ?: emptyList<Any>()
+
+            val psiManager = com.intellij.psi.PsiManager.getInstance(project)
+            val docManager = com.intellij.openapi.fileEditor.FileDocumentManager.getInstance()
+            val progress = com.intellij.openapi.progress.ProgressManager.getInstance()
+
+            data class P(val file: String, val line: Int, val severity: String, val tool: String, val desc: String)
+            val problems = ArrayList<P>()
+            var filesInspected = 0
+
+            for (vf in scopeFiles) {
+                suspendingReadAction {
+                    val psiFile = psiManager.findFile(vf) ?: return@suspendingReadAction
+                    val wrappers = ArrayList<Any>()
+                    for (tools in allTools) {
+                        val w = tools!!.javaClass.methods
+                            .firstOrNull { it.name == "getEnabledTool" && it.parameterCount == 2 }
+                            ?.invoke(tools, psiFile, false) ?: continue
+                        if (w.javaClass.name == liwName) wrappers.add(w)
+                    }
+                    if (wrappers.isEmpty()) return@suspendingReadAction
+                    val range = com.intellij.openapi.util.TextRange(0, psiFile.textLength)
+                    val indicator = com.intellij.openapi.progress.EmptyProgressIndicator()
+                    @Suppress("UNCHECKED_CAST")
+                    val map = progress.runProcess(
+                        com.intellij.openapi.util.Computable {
+                            inspectEx.invoke(null, wrappers, psiFile, range, range, false, true, true, indicator, TRUE_PAIR_PROCESSOR)
+                        },
+                        indicator
+                    ) as Map<Any, List<Any>>
+                    filesInspected++
+                    val rel = getRelativePath(project, vf)
+                    for ((toolWrapper, descriptors) in map) {
+                        val shortName = toolWrapper!!.javaClass.methods
+                            .firstOrNull { it.name == "getShortName" }?.invoke(toolWrapper)?.toString() ?: "?"
+                        for (d in descriptors) {
+                            val desc = d as com.intellij.codeInspection.ProblemDescriptor
+                            val psi = desc.psiElement
+                            val line = if (psi != null && psi.containingFile != null) {
+                                val dvf = psi.containingFile.virtualFile
+                                val doc = dvf?.let { docManager.getDocument(it) }
+                                if (doc != null) doc.getLineNumber(psi.textOffset) + 1 else 1
+                            } else 1
+                            val sev = try {
+                                // HighlightDisplayKey / InspectionProfile impl are runtime-only here → reflect
+                                val key = Class.forName("com.intellij.codeHighlighting.HighlightDisplayKey", true, appCl)
+                                    .methods.firstOrNull { it.name == "find" && it.parameterCount == 1 }
+                                    ?.invoke(null, shortName)
+                                if (key != null) {
+                                    val level = profile.javaClass.methods
+                                        .firstOrNull { it.name == "getErrorLevel" && it.parameterCount == 2 }
+                                        ?.invoke(profile, key, psi)
+                                    levelName(level)
+                                } else "WARNING"
+                            } catch (_: Throwable) { "WARNING" }
+                            if (problems.size < 2000) {
+                                problems.add(P(rel, line, sev, shortName, desc.descriptionTemplate ?: ""))
+                            }
+                        }
+                    }
+                }
+            }
+
+            val byTool = problems.groupingBy { it.tool }.eachCount()
+            buildString {
+                appendLine("""{"engine":"daemon-core","scope":"files","filesInspected":$filesInspected,""" +
+                    """"total":${problems.size},"byTool":${byTool.entries.joinToString(",", "{", "}") { "\"${it.key}\":${it.value}" }}}""")
+                if (problems.isNotEmpty()) appendLine("problems:")
+                for (p in problems.take(60)) {
+                    appendLine("  [${p.severity}] ${p.tool} — ${p.file}:${p.line} ${p.desc.take(140)}")
+                }
+            }
+        } catch (t: Throwable) {
+            "daemon-core engine unavailable: ${t.javaClass.simpleName}: ${t.message}"
+        }
+    }
+
+    private fun levelName(level: Any?): String = try {
+        level?.javaClass?.methods?.firstOrNull { it.name == "getName" }?.invoke(level)?.toString()
+            ?: level?.toString() ?: "WARNING"
+    } catch (_: Throwable) { "WARNING" }
 
     private fun deleteRecursivelyQuietly(dir: java.nio.file.Path) {
         runCatching {
