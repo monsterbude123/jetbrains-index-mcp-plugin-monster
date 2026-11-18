@@ -44,6 +44,7 @@ import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.ChangeSi
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.CreateFileTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.EditMemberTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.CreateFromTemplateTool
+import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.RunControlTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.ExtractMethodTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.InsertMemberTool
 import com.github.hechtcarmel.jetbrainsindexmcpplugin.tools.refactoring.MoveFileTool
@@ -295,6 +296,7 @@ class ToolRegistry {
         register(InsertMemberTool())
         register(ExtractMethodTool())
         register(CreateFromTemplateTool())
+        register(RunControlTool())
         register(ReplaceMemberTool())
 
         // Fast search tools (universal)
